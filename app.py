@@ -21,10 +21,22 @@ logger = logging.getLogger(__name__)
 # Your Hugging Face Space endpoint
 SPACE_NAME = "Anurag3703/bert-spam-classifier-demo"
 
-# Initialize Gradio client (lightweight!)
-logger.info(f"Initializing connection to Space: {SPACE_NAME}")
-client = Client(SPACE_NAME)
-logger.info("✅ Connected to Space successfully!")
+# Global client variable (lazy loaded)
+_client = None
+
+
+def get_client():
+    """Lazy load the Gradio client"""
+    global _client
+    if _client is None:
+        logger.info(f"Initializing connection to Space: {SPACE_NAME}")
+        try:
+            _client = Client(SPACE_NAME)
+            logger.info("✅ Connected to Space successfully!")
+        except Exception as e:
+            logger.error(f"Failed to connect to Space: {e}")
+            raise
+    return _client
 
 
 @app.route('/classify', methods=['POST'])
@@ -57,6 +69,9 @@ def classify():
             return jsonify({'error': 'No text provided'}), 400
 
         logger.info(f"Classifying text: '{text[:50]}...'")
+
+        # Get client (lazy loaded)
+        client = get_client()
 
         # Call your Space's API
         result = client.predict(text, api_name="/predict")
@@ -110,6 +125,9 @@ def classify_batch():
         if not texts or not isinstance(texts, list):
             return jsonify({'error': 'Please provide a list of texts'}), 400
 
+        # Get client (lazy loaded)
+        client = get_client()
+
         results = []
         for text in texts:
             if text.strip():
@@ -136,11 +154,22 @@ def classify_batch():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'space': SPACE_NAME,
-        'endpoint': f"https://{SPACE_NAME.replace('/', '-')}.hf.space"
-    })
+    try:
+        # Try to get client status
+        client_status = "connected" if _client is not None else "not_initialized"
+
+        return jsonify({
+            'status': 'healthy',
+            'space': SPACE_NAME,
+            'endpoint': f"https://{SPACE_NAME.replace('/', '-')}.hf.space",
+            'client_status': client_status
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'healthy',
+            'space': SPACE_NAME,
+            'note': 'Client will initialize on first request'
+        })
 
 
 @app.route('/', methods=['GET'])
@@ -167,4 +196,7 @@ def home():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    import os
+
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)
