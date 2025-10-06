@@ -3,6 +3,7 @@ from flask_cors import CORS
 import requests
 import logging
 import time
+import os
 
 app = Flask(__name__)
 
@@ -17,10 +18,16 @@ CORS(app, resources={
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+HF_TOKEN = os.environ.get('HF_TOKEN')
+
+if not HF_TOKEN:
+    logger.error("HF_TOKEN environment variable not set!")
+    raise ValueError("HF_TOKEN must be set as environment variable")
 # Use Inference API instead of Space
 MODEL_NAME = "Anurag3703/bert-spam-classifier"
 API_URL = f"https://api-inference.huggingface.co/models/{MODEL_NAME}"
-HF_TOKEN = "YOUR_HF_TOKEN_HERE"  # Add as environment variable in Render
+
 
 headers = {"Authorization": f"Bearer {HF_TOKEN}"}
 
