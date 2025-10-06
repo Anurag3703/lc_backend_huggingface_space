@@ -3,6 +3,7 @@ from flask_cors import CORS
 from gradio_client import Client
 import logging
 import time
+import json
 
 app = Flask(__name__)
 
@@ -24,43 +25,64 @@ _client = None
 _client_init_time = None
 
 
-def get_client(max_retries=3):
-    """Lazy load Gradio client"""
+def get_client(max_retries=5, initial_wait=20):
+    """
+    Lazy load Gradio client with extended wait times for cold starts
+    """
     global _client, _client_init_time
 
     # Return cached client if recent (within 10 minutes)
     if _client is not None:
         if _client_init_time and (time.time() - _client_init_time) < 600:
+            logger.info("Using cached client")
             return _client
         else:
-            logger.info("Client cache expired, reinitializing...")
+            logger.info("Client cache expired")
             _client = None
 
-    # Initialize with retry
+    # Initialize with retry and progressive backoff
     for attempt in range(max_retries):
         try:
             logger.info(f"Connecting to Space (attempt {attempt + 1}/{max_retries})")
 
-            _client = Client(SPACE_NAME, verbose=False)
+            # Wait longer on first attempt to let Space wake up
+            if attempt == 0:
+                logger.info(f"First attempt - waiting {initial_wait}s for Space to wake up...")
+                time.sleep(initial_wait)
+
+            # Try to initialize client
+            try:
+                _client = Client(SPACE_NAME, verbose=False)
+                logger.info("Client initialized, testing connection...")
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON decode error (Space still waking): {str(e)}")
+                raise Exception("Space is still initializing")
 
             # Test with sample prediction
-            logger.info("Testing connection...")
-            _client.predict("test", api_name="/predict")
+            try:
+                test_result = _client.predict("test", api_name="/predict")
+                logger.info(f"Test prediction successful: {test_result}")
+            except Exception as e:
+                logger.warning(f"Test prediction failed: {str(e)}")
+                raise
 
             _client_init_time = time.time()
-            logger.info("✅ Connected successfully!")
+            logger.info("✅ Connected and tested successfully!")
             return _client
 
         except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+            error_msg = str(e)
+            logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
+
             if attempt < max_retries - 1:
-                wait = 15 * (attempt + 1)
-                logger.info(f"Retrying in {wait}s...")
+                # Progressive backoff: 20s, 30s, 40s, 50s
+                wait = initial_wait + (10 * attempt)
+                logger.info(f"Space needs more time to wake up. Waiting {wait}s...")
                 time.sleep(wait)
             else:
                 raise Exception(
-                    f"Could not connect after {max_retries} attempts. "
-                    "Space might be sleeping. Try /warmup first."
+                    f"Could not connect after {max_retries} attempts over {sum(range(initial_wait, initial_wait + 10 * max_retries, 10))}s. "
+                    "The Space might be having issues. Try again in a few minutes."
                 )
 
     return _client
@@ -89,7 +111,7 @@ def classify():
             return jsonify({
                 'error': 'Space connection failed',
                 'details': str(e),
-                'suggestion': 'Call /warmup first to wake the Space'
+                'suggestion': 'The Space is sleeping or starting up. Call /warmup and wait 60-90 seconds, then try again.'
             }), 503
 
         # Predict with retry
@@ -106,7 +128,10 @@ def classify():
                 if attempt < max_retries - 1:
                     time.sleep(5)
                 else:
-                    raise Exception(f"Prediction failed: {str(e)}")
+                    # Client might be stale, reset it
+                    global _client
+                    _client = None
+                    raise Exception(f"Prediction failed: {str(e)}. Try /warmup again.")
 
         # Parse result
         spam_conf = next(
@@ -131,41 +156,44 @@ def classify():
             }
         }
 
-        logger.info(f"✅ {label} ({confidence:.2%})")
+        logger.info(f"✅ Result: {label} ({confidence:.2%})")
         return jsonify(response)
 
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        logger.error(f"Classification error: {str(e)}")
         return jsonify({
             'error': str(e),
-            'message': 'Classification failed. Try /warmup first.'
+            'message': 'Classification failed. Try /warmup first and wait 60-90 seconds.'
         }), 500
 
 
 @app.route('/warmup', methods=['GET'])
 def warmup():
-    """Wake up and test the Space"""
+    """Wake up and test the Space - this can take 60-90 seconds"""
     try:
-        logger.info("🔥 Warming up Space (30-60 seconds)...")
+        logger.info("🔥 Starting warmup (this will take 60-90 seconds)...")
         start = time.time()
 
         # Force reinit
         global _client
         _client = None
 
-        # Get client (this initializes and tests)
-        client = get_client(max_retries=5)
+        # Get client with extended wait times
+        client = get_client(max_retries=5, initial_wait=30)
 
-        # Additional test prediction
-        test_result = client.predict("This is a test", api_name="/predict")
+        # Do additional test prediction
+        logger.info("Performing final test prediction...")
+        test_result = client.predict("This is a test message", api_name="/predict")
+        logger.info(f"Final test result: {test_result}")
 
         elapsed = time.time() - start
 
         return jsonify({
             'status': 'success',
-            'message': 'Space warmed up successfully',
+            'message': 'Space is fully warmed up and ready to use',
             'space': SPACE_NAME,
-            'warmup_time': round(elapsed, 2)
+            'warmup_time_seconds': round(elapsed, 2),
+            'note': 'You can now use /classify'
         })
 
     except Exception as e:
@@ -173,7 +201,8 @@ def warmup():
         return jsonify({
             'status': 'failed',
             'error': str(e),
-            'message': 'Could not connect to Space'
+            'message': 'Could not connect to Space after multiple attempts',
+            'suggestion': 'The Space might be having issues. Wait 2-3 minutes and try again.'
         }), 503
 
 
@@ -181,11 +210,16 @@ def warmup():
 def health():
     """Health check"""
     client_status = "connected" if _client is not None else "not_initialized"
+    space_age = None
+
+    if _client_init_time:
+        space_age = round(time.time() - _client_init_time, 0)
 
     return jsonify({
         'status': 'healthy',
         'space': SPACE_NAME,
-        'client_status': client_status
+        'client_status': client_status,
+        'client_age_seconds': space_age
     })
 
 
@@ -194,18 +228,20 @@ def home():
     """API docs"""
     return jsonify({
         'name': 'BERT Spam Classifier API',
-        'version': '1.3',
+        'version': '1.4',
         'space': SPACE_NAME,
         'endpoints': {
-            '/': 'GET - Docs',
+            '/': 'GET - Documentation',
             '/health': 'GET - Health check',
-            '/warmup': 'GET - Wake Space (CALL FIRST!)',
+            '/warmup': 'GET - Wake Space (REQUIRED on first use - takes 60-90s)',
             '/classify': 'POST - Classify text'
         },
         'usage': {
-            'step_1': 'GET /warmup (wait 30-60s)',
-            'step_2': 'POST /classify {"text": "your message"}'
-        }
+            'step_1': 'Call GET /warmup',
+            'step_2': 'Wait for success response (60-90 seconds)',
+            'step_3': 'Call POST /classify with {"text": "your message"}'
+        },
+        'important': 'Always call /warmup first after deployment or long inactivity'
     })
 
 
@@ -215,5 +251,6 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"🚀 Starting on port {port}")
     logger.info(f"📡 Space: {SPACE_NAME}")
-    logger.info("💡 Client will lazy load on first request")
+    logger.info("⚠️  IMPORTANT: Space takes 60-90s to wake up on first request")
+    logger.info("💡 Always call /warmup first!")
     app.run(debug=False, host='0.0.0.0', port=port)
