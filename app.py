@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from gradio_client import Client
 import logging
+import time
 
 app = Flask(__name__)
 
@@ -25,17 +26,29 @@ SPACE_NAME = "Anurag3703/bert-spam-classifier-demo"
 _client = None
 
 
-def get_client():
-    """Lazy load the Gradio client"""
+def get_client(max_retries=3, retry_delay=5):
+    """Lazy load the Gradio client with retry logic"""
     global _client
-    if _client is None:
-        logger.info(f"Initializing connection to Space: {SPACE_NAME}")
+
+    if _client is not None:
+        return _client
+
+    for attempt in range(max_retries):
         try:
+            logger.info(f"Initializing connection to Space (attempt {attempt + 1}/{max_retries}): {SPACE_NAME}")
             _client = Client(SPACE_NAME)
             logger.info("✅ Connected to Space successfully!")
+            return _client
         except Exception as e:
-            logger.error(f"Failed to connect to Space: {e}")
-            raise
+            logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Failed to connect after {max_retries} attempts")
+                raise Exception(
+                    f"Could not connect to Space after {max_retries} attempts. The Space might be sleeping or unavailable.")
+
     return _client
 
 
@@ -70,11 +83,21 @@ def classify():
 
         logger.info(f"Classifying text: '{text[:50]}...'")
 
-        # Get client (lazy loaded)
+        # Get client with retry logic
         client = get_client()
 
-        # Call your Space's API
-        result = client.predict(text, api_name="/predict")
+        # Call Space API with retry
+        max_predict_retries = 3
+        for attempt in range(max_predict_retries):
+            try:
+                result = client.predict(text, api_name="/predict")
+                break
+            except Exception as e:
+                if attempt < max_predict_retries - 1:
+                    logger.warning(f"Prediction attempt {attempt + 1} failed: {str(e)}, retrying...")
+                    time.sleep(3)
+                else:
+                    raise Exception(f"Prediction failed after {max_predict_retries} attempts: {str(e)}")
 
         # Parse the result
         spam_confidence = next(
@@ -105,7 +128,10 @@ def classify():
 
     except Exception as e:
         logger.error(f"Error during classification: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'error': str(e),
+            'message': 'Classification failed. The Space might be sleeping. Please try again in 30 seconds.'
+        }), 500
 
 
 @app.route('/classify/batch', methods=['POST'])
@@ -125,37 +151,70 @@ def classify_batch():
         if not texts or not isinstance(texts, list):
             return jsonify({'error': 'Please provide a list of texts'}), 400
 
-        # Get client (lazy loaded)
+        # Get client with retry logic
         client = get_client()
 
         results = []
         for text in texts:
             if text.strip():
-                result = client.predict(text, api_name="/predict")
+                try:
+                    result = client.predict(text, api_name="/predict")
 
-                spam_conf = next((item['confidence'] for item in result['confidences']
-                                  if item['label'] == 'Spam'), 0)
-                ham_conf = next((item['confidence'] for item in result['confidences']
-                                 if item['label'] == 'Not Spam (Ham)'), 0)
+                    spam_conf = next((item['confidence'] for item in result['confidences']
+                                      if item['label'] == 'Spam'), 0)
+                    ham_conf = next((item['confidence'] for item in result['confidences']
+                                     if item['label'] == 'Not Spam (Ham)'), 0)
 
-                results.append({
-                    'text': text,
-                    'label': "spam" if spam_conf > ham_conf else "ham",
-                    'confidence': round(max(spam_conf, ham_conf), 4)
-                })
+                    results.append({
+                        'text': text,
+                        'label': "spam" if spam_conf > ham_conf else "ham",
+                        'confidence': round(max(spam_conf, ham_conf), 4)
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to classify text '{text[:30]}...': {str(e)}")
+                    results.append({
+                        'text': text,
+                        'error': 'Classification failed'
+                    })
 
         return jsonify({'results': results})
 
     except Exception as e:
         logger.error(f"Error during batch classification: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'error': str(e),
+            'message': 'Batch classification failed. Please try again.'
+        }), 500
+
+
+@app.route('/warmup', methods=['GET'])
+def warmup():
+    """Warmup endpoint to initialize the Space connection"""
+    try:
+        logger.info("Warming up Space connection...")
+        client = get_client()
+
+        # Test with a simple prediction
+        test_result = client.predict("test", api_name="/predict")
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Space connection initialized and warmed up',
+            'space': SPACE_NAME
+        })
+    except Exception as e:
+        logger.error(f"Warmup failed: {str(e)}")
+        return jsonify({
+            'status': 'failed',
+            'error': str(e),
+            'message': 'Could not connect to Space. It might be sleeping.'
+        }), 503
 
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
     try:
-        # Try to get client status
         client_status = "connected" if _client is not None else "not_initialized"
 
         return jsonify({
@@ -182,6 +241,7 @@ def home():
         'endpoints': {
             '/': 'GET - API documentation',
             '/health': 'GET - Health check',
+            '/warmup': 'GET - Warmup Space connection',
             '/classify': 'POST - Classify single text',
             '/classify/batch': 'POST - Classify multiple texts'
         },
@@ -191,7 +251,8 @@ def home():
             'body': {
                 'text': 'Win a free iPhone now!'
             }
-        }
+        },
+        'note': 'First request may take 20-30 seconds if Space is sleeping. Use /warmup to initialize.'
     })
 
 
